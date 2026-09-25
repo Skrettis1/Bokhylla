@@ -1,0 +1,15 @@
+services:
+  bokhylla:
+    build: .
+    container_name: bokhylla
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      TZ: ${TZ:-Europe/Oslo}
+      OPENLIBRARY_USER_AGENT: ${OPENLIBRARY_USER_AGENT:-BokhyllaHome/1.0}
+      OPENLIBRARY_CONTACT: ${OPENLIBRARY_CONTACT:-change-me@example.invalid}
+      SYNC_DAY: ${SYNC_DAY:-sun}
+      SYNC_HOUR: ${SYNC_HOUR:-3}
+    volumes:
+      - ./data:/app/data

@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="nb"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Min bokhylle</title><link rel="stylesheet" href="/assets/style.css"></head>
+<body><header><div class="brand"><span class="logo">▤</span><div><h1>Min bokhylle</h1><small>Privat boksamling</small></div></div><button id="syncAll">Oppdater alle</button></header>
+<main><aside><div class="panel"><h2>Forfattere</h2><div id="authors"></div><form id="addAuthor" class="addAuthor"><input id="newAuthorName" placeholder="Ny forfatter ..." autocomplete="off"><button type="submit">Legg til</button></form></div><div class="stats"><small>TOTALT</small><strong id="stats">0 av 0 lest</strong></div><div class="panel logPanel"><h2>Synk-logg</h2><div id="syncLog"></div></div></aside>
+<section><div id="notice" class="notice">Velg en forfatter og hent boklisten fra Open Library.</div><div class="toolbar"><div><small>BIBLIOTEK</small><h2 id="authorName">Velg forfatter</h2></div><button id="syncAuthor">Hent fra Open Library</button></div><input id="search" placeholder="Søk i bøkene ..."><div id="books" class="books"></div></section></main>
+<script src="/assets/app.js"></script></body></html>
