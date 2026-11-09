@@ -1,7 +1,7 @@
-# Debian 13 ships Python 3.13. Keep the runtime dependencies on versions
-# with current Python 3.13 support.
-fastapi==0.116.1
-pydantic==2.11.7
-uvicorn==0.35.0
+# Runs on Python 3.13 (Debian 13) and 3.14 (macOS/Homebrew). Keep the
+# runtime dependencies on versions with wheels for both.
+fastapi==0.162.2
+pydantic==2.14.3
+uvicorn==0.54.0
 httpx==0.28.1
-apscheduler==3.11.0
+apscheduler==3.11.3

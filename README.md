@@ -10,14 +10,23 @@ En lokal webapp for forfattere, boklister, lest-status, A/H/T-tagger, Open Libra
 
 Appen kjører direkte i et virtuelt Python-miljø og installeres som en systemd-tjeneste. Den kan kjøres på både x86_64 og ARM64-maskiner med Debian 13.
 
-## Installer
+## Kjør på Mac
+
+```bash
+cd ~/Desktop/Utvikling/bokhylla
+./start-mac.sh
+```
+
+Første gang lages et virtuelt Python-miljø (`.venv`) og pakkene installeres. Appen åpnes på http://localhost:8080 (port fra `APP_PORT` i `.env`). Stopp med Ctrl+C. Data lagres i `data/` i prosjektmappa. Den ukentlige synkroniseringen kjører bare mens appen er i gang.
+
+## Installer på Debian
 
 1. Pakk ut prosjektet på Debian-maskinen.
 2. Endre `OPENLIBRARY_CONTACT` i `.env.example` til din e-postadresse, eller rediger `.env` etter første kjøring.
 3. Kjør:
 
 ```bash
-cd bokhylla-rock3c
+cd bokhylla
 ./install.sh
 ```
 
@@ -45,14 +54,25 @@ Ta gjerne en ekstra sikkerhetskopi av hele `data`-mappen.
 ## Synkronisering
 
 - Manuell synkronisering per forfatter i GUI-et
-- Manuell synkronisering av alle forfattere
+- Manuell synkronisering av alle forfattere (kjører i bakgrunnen; synk-loggen viser framdriften)
 - Ukentlig synkronisering, standard søndag kl. 03:00
 - Endres i `.env` med `SYNC_DAY` og `SYNC_HOUR`
 
 ## Viktig om serier
 
-Open Library har ikke alltid komplette serieopplysninger. Nye verk plasseres derfor under `Ikke plassert i serie`. API-et støtter feltene `series_name` og `series_order`, men redigeringsskjerm for disse er neste funksjonelle steg.
+Open Library har ikke alltid komplette serieopplysninger. Nye verk plasseres derfor under `Ikke plassert i serie`. Trykk ✎ på en bok for å sette serie og nummer i serien (med forslag fra seriene du allerede har brukt), rette tittel/årstall eller skjule boka. «Vis skjulte» viser skjulte bøker igjen.
+
+Lest-status, A/H/T-tagger, serie og skjuling påvirker ikke synkroniseringen. Retter du tittel eller årstall for hånd, beholdes endringen ved neste synk.
 
 ## Første oppstart
 
 Forfatterne opprettes automatisk, men boklistene er tomme. Velg en forfatter og trykk `Hent fra Open Library`.
+
+## Tester
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
+
+Testene bruker en midlertidig datamappe og falske svar fra Open Library, så de trenger verken nett eller dine data.

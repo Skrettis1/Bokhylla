@@ -1,8 +1,10 @@
+import asyncio
 import os
 import re
 import shutil
 import sqlite3
 import unicodedata
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -15,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 BASE = Path(__file__).resolve().parents[1]
-DATA = BASE / "data"
+DATA = Path(os.getenv("BOKHYLLA_DATA_DIR", str(BASE / "data")))
 DB = DATA / "library.db"
 COVERS = DATA / "covers"
 BACKUPS = DATA / "backups"
@@ -26,7 +28,13 @@ AUTHORS = [
     "Tom Egeland", "Jørn Lier Horst", "Thomas Enger", "Ørjan Karlsson"
 ]
 
+NO_SERIES = "Ikke plassert i serie"
+COVER_DOWNLOADS_AT_ONCE = 4
+
 scheduler = AsyncIOScheduler(timezone=os.getenv("TZ", "Europe/Oslo"))
+
+# "Sync all" runs in the background; this tells the UI whether it is still going.
+sync_all_state = {"running": False}
 
 def db():
     connection = sqlite3.connect(DB)
@@ -78,6 +86,10 @@ def init_db():
                 pass
         for name in AUTHORS:
             con.execute("INSERT OR IGNORE INTO authors(name) VALUES(?)", (name,))
+        # A sync that was cut off (the app stopped mid-way) is no longer running.
+        con.execute(
+            "UPDATE sync_log SET status='error', message='Avbrutt' WHERE status='running'"
+        )
 
 def normalize(value: str) -> str:
     value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode().lower()
@@ -88,6 +100,9 @@ def headers():
     contact = os.getenv("OPENLIBRARY_CONTACT", "change-me@example.invalid")
     return {"User-Agent": f"{agent} ({contact})"}
 
+def now():
+    return datetime.now().isoformat(timespec="seconds")
+
 async def download_cover(client, cover_id, work_key):
     if not cover_id:
         return None
@@ -96,24 +111,33 @@ async def download_cover(client, cover_id, work_key):
     if target.exists() and target.stat().st_size > 1000:
         return filename
     url = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg?default=false"
-    response = await client.get(url, follow_redirects=True)
+    try:
+        response = await client.get(url, follow_redirects=True)
+    except httpx.HTTPError:
+        return None
     if response.status_code == 200 and response.headers.get("content-type", "").startswith("image/"):
         target.write_bytes(response.content)
         return filename
     return None
 
+def parse_year(value):
+    try:
+        return int(str(value)[:4]) if value else None
+    except ValueError:
+        return None
+
 async def sync_author(author_id: int):
-    started = datetime.now().isoformat(timespec="seconds")
     with db() as con:
         author = con.execute("SELECT * FROM authors WHERE id=?", (author_id,)).fetchone()
         if not author:
             raise HTTPException(404, "Forfatter ikke funnet")
         log_id = con.execute(
             "INSERT INTO sync_log(author_id,author_name,started,status,message) VALUES(?,?,?,?,?)",
-            (author_id, author["name"], started, "running", None),
+            (author_id, author["name"], now(), "running", None),
         ).lastrowid
 
     try:
+        # 1. Fetch from Open Library. The database is not held open while waiting on the network.
         async with httpx.AsyncClient(timeout=30, headers=headers()) as client:
             search = await client.get("https://openlibrary.org/search/authors.json", params={"q": author["name"]})
             search.raise_for_status()
@@ -127,53 +151,92 @@ async def sync_author(author_id: int):
             key = match["key"]
             works_response = await client.get(f"https://openlibrary.org/authors/{key}/works.json", params={"limit": 1000})
             works_response.raise_for_status()
-            entries = works_response.json().get("entries", [])
-            inserted = 0
-            updated = 0
+
+            works = []
             seen = set()
+            for work in works_response.json().get("entries", []):
+                work_key = work.get("key")
+                if not work_key or work_key in seen:
+                    continue
+                seen.add(work_key)
+                works.append({
+                    "work_key": work_key,
+                    "title": str(work.get("title") or "Uten tittel").strip(),
+                    "year": parse_year(work.get("first_publish_date")),
+                    "cover_id": (work.get("covers") or [None])[0],
+                })
+
             with db() as con:
-                for work in entries:
-                    work_key = work.get("key")
-                    title = str(work.get("title") or "Uten tittel").strip()
-                    if not work_key or work_key in seen:
-                        continue
-                    seen.add(work_key)
-                    existing = con.execute("SELECT * FROM books WHERE author_id=? AND work_key=?", (author_id, work_key)).fetchone()
-                    cover_id = (work.get("covers") or [None])[0]
-                    cover_file = existing["cover_file"] if existing else None
-                    if not cover_file:
-                        cover_file = await download_cover(client, cover_id, work_key)
-                    year_raw = work.get("first_publish_date")
-                    try:
-                        year = int(str(year_raw)[:4]) if year_raw else None
-                    except ValueError:
-                        year = None
-                    if existing:
-                        if not existing["manual_lock"]:
-                            con.execute("UPDATE books SET title=?,publish_year=?,cover_file=COALESCE(?,cover_file) WHERE id=?", (title, year, cover_file, existing["id"]))
-                        updated += 1
-                    else:
-                        con.execute("INSERT INTO books(author_id,work_key,title,publish_year,cover_file) VALUES(?,?,?,?,?)", (author_id, work_key, title, year, cover_file))
-                        inserted += 1
-                finished = datetime.now().isoformat(timespec="seconds")
-                con.execute("UPDATE authors SET openlibrary_key=?,last_sync=? WHERE id=?", (key, finished, author_id))
-                con.execute("UPDATE sync_log SET finished=?,status='ok',message=? WHERE id=?", (finished, f"{inserted} nye, {updated} oppdatert", log_id))
-            return {"status": "ok", "inserted": inserted, "updated": updated, "works": len(seen)}
-    except Exception as exc:
-        finished = datetime.now().isoformat(timespec="seconds")
+                existing = {
+                    row["work_key"]: dict(row)
+                    for row in con.execute("SELECT * FROM books WHERE author_id=?", (author_id,))
+                }
+
+            # 2. Download missing covers, a few at a time.
+            limit = asyncio.Semaphore(COVER_DOWNLOADS_AT_ONCE)
+
+            async def cover_for(work):
+                current = existing.get(work["work_key"], {}).get("cover_file")
+                if current:
+                    return current
+                async with limit:
+                    return await download_cover(client, work["cover_id"], work["work_key"])
+
+            covers = await asyncio.gather(*(cover_for(w) for w in works))
+
+        # 3. Write everything in one short transaction.
+        inserted = 0
+        updated = 0
         with db() as con:
-            con.execute("UPDATE sync_log SET finished=?,status='error',message=? WHERE id=?", (finished, str(exc), log_id))
+            for work, cover_file in zip(works, covers):
+                current = existing.get(work["work_key"])
+                if current:
+                    # Titles/years the user has edited by hand are left alone.
+                    if not current["manual_lock"]:
+                        con.execute(
+                            "UPDATE books SET title=?,publish_year=?,cover_file=COALESCE(?,cover_file) WHERE id=?",
+                            (work["title"], work["year"], cover_file, current["id"]),
+                        )
+                    elif cover_file:
+                        con.execute("UPDATE books SET cover_file=COALESCE(cover_file,?) WHERE id=?", (cover_file, current["id"]))
+                    updated += 1
+                else:
+                    con.execute(
+                        "INSERT INTO books(author_id,work_key,title,publish_year,cover_file) VALUES(?,?,?,?,?)",
+                        (author_id, work["work_key"], work["title"], work["year"], cover_file),
+                    )
+                    inserted += 1
+            finished = now()
+            con.execute("UPDATE authors SET openlibrary_key=?,last_sync=? WHERE id=?", (key, finished, author_id))
+            con.execute(
+                "UPDATE sync_log SET finished=?,status='ok',message=? WHERE id=?",
+                (finished, f"{inserted} nye, {updated} oppdatert", log_id),
+            )
+        return {"status": "ok", "inserted": inserted, "updated": updated, "works": len(works)}
+    except Exception as exc:
+        with db() as con:
+            con.execute(
+                "UPDATE sync_log SET finished=?,status='error',message=? WHERE id=?",
+                (now(), str(exc) or exc.__class__.__name__, log_id),
+            )
         raise
 
 async def sync_all():
-    with db() as con:
-        ids = [row["id"] for row in con.execute("SELECT id FROM authors ORDER BY id")]
-    for author_id in ids:
-        try:
-            await sync_author(author_id)
-        except Exception:
-            pass
-    backup_db()
+    """Sync every author, then back up the database. Runs one at a time."""
+    if sync_all_state["running"]:
+        return
+    sync_all_state["running"] = True
+    try:
+        with db() as con:
+            ids = [row["id"] for row in con.execute("SELECT id FROM authors ORDER BY id")]
+        for author_id in ids:
+            try:
+                await sync_author(author_id)
+            except Exception:
+                pass  # Already recorded in the sync log.
+        backup_db()
+    finally:
+        sync_all_state["running"] = False
 
 def backup_db():
     if DB.exists():
@@ -193,20 +256,26 @@ class BookUpdate(BaseModel):
     series_name: Optional[str] = None
     series_order: Optional[float] = None
     hidden: Optional[bool] = None
+    title: Optional[str] = None
+    publish_year: Optional[int] = None
 
-app = FastAPI(title="Bokhylla", version="0.1.0")
+# Fields that Open Library also fills in. Editing one by hand stops the sync
+# from overwriting it; reading status, tags, series and hiding never do.
+SYNCED_FIELDS = {"title", "publish_year"}
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
-    day = os.getenv("SYNC_DAY", "sun")
-    hour = int(os.getenv("SYNC_HOUR", "3"))
-    scheduler.add_job(sync_all, "cron", day_of_week=day, hour=hour, minute=0, id="weekly-sync", replace_existing=True)
-    scheduler.start()
+    if os.getenv("BOKHYLLA_DISABLE_SCHEDULER") != "1":
+        day = os.getenv("SYNC_DAY", "sun")
+        hour = int(os.getenv("SYNC_HOUR", "3"))
+        scheduler.add_job(sync_all, "cron", day_of_week=day, hour=hour, minute=0, id="weekly-sync", replace_existing=True)
+        scheduler.start()
+    yield
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
 
-@app.on_event("shutdown")
-async def shutdown():
-    scheduler.shutdown(wait=False)
+app = FastAPI(title="Bokhylla", version="0.2.0", lifespan=lifespan)
 
 app.mount("/covers", StaticFiles(directory=COVERS, check_dir=False), name="covers")
 app.mount("/assets", StaticFiles(directory=STATIC, check_dir=False), name="assets")
@@ -255,20 +324,31 @@ def get_sync_log(limit: int = 20):
     return [dict(row) for row in rows]
 
 @app.get("/api/authors/{author_id}/books")
-def get_books(author_id: int):
+def get_books(author_id: int, include_hidden: bool = False):
     with db() as con:
-        rows = con.execute("""
-          SELECT * FROM books WHERE author_id=? AND hidden=0
+        rows = con.execute(f"""
+          SELECT * FROM books WHERE author_id=? {"" if include_hidden else "AND hidden=0"}
           ORDER BY series_name COLLATE NOCASE, COALESCE(series_order,999999), COALESCE(publish_year,9999), title COLLATE NOCASE
         """, (author_id,)).fetchall()
     result = []
     for row in rows:
         item = dict(row)
         item["read"] = bool(item["read"])
+        item["hidden"] = bool(item["hidden"])
         item["tags"] = [x for x in item["tags"].split(",") if x]
         item["cover_url"] = f"/covers/{item['cover_file']}" if item["cover_file"] else None
         result.append(item)
     return result
+
+@app.get("/api/series")
+def get_series():
+    """Series names in use, for suggestions when placing a book in a series."""
+    with db() as con:
+        rows = con.execute(
+            "SELECT DISTINCT series_name FROM books WHERE series_name<>? ORDER BY series_name COLLATE NOCASE",
+            (NO_SERIES,),
+        ).fetchall()
+    return [row["series_name"] for row in rows]
 
 @app.post("/api/authors/{author_id}/sync")
 async def start_sync(author_id: int):
@@ -281,8 +361,17 @@ async def start_sync(author_id: int):
 
 @app.post("/api/sync-all")
 async def start_sync_all():
-    await sync_all()
-    return {"status": "ok"}
+    """Starts syncing every author in the background; poll /api/sync-status."""
+    if sync_all_state["running"]:
+        return {"status": "running"}
+    app.state.sync_task = asyncio.create_task(sync_all())
+    # sync_all marks itself as running right away, before its first await.
+    await asyncio.sleep(0)
+    return {"status": "started"}
+
+@app.get("/api/sync-status")
+def get_sync_status():
+    return {"running": sync_all_state["running"]}
 
 @app.patch("/api/books/{book_id}")
 def update_book(book_id: int, update: BookUpdate):
@@ -294,11 +383,18 @@ def update_book(book_id: int, update: BookUpdate):
             value = ",".join(sorted(set(x for x in value if x in {"A", "H", "T"})))
         if key in {"read", "hidden"}:
             value = int(bool(value))
+        if key == "series_name":
+            value = (value or "").strip() or NO_SERIES
+        if key == "title":
+            value = (value or "").strip()
+            if not value:
+                raise HTTPException(400, "Tittel kan ikke være tom")
         fields.append(f"{key}=?")
         values.append(value)
     if not fields:
         return {"status": "unchanged"}
-    fields.append("manual_lock=1")
+    if SYNCED_FIELDS & data.keys():
+        fields.append("manual_lock=1")
     values.append(book_id)
     with db() as con:
         cur = con.execute(f"UPDATE books SET {', '.join(fields)} WHERE id=?", values)
