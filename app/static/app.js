@@ -102,7 +102,7 @@ function renderBooks() {
           return `<article class="book${b.hidden ? " isHidden" : ""}"><img class="cover" src="${b.cover_url || ""}" onerror="this.remove()" alt=""><div class="bookInfo"><div class="meta">#${i + 1}${b.publish_year ? " · " + b.publish_year : ""} · ${series}${b.hidden ? " · skjult" : ""}</div><h3>${escapeHtml(b.title)}</h3><div class="tags">${["A", "H", "T"].map((t) => `<button class="tag ${b.tags.includes(t) ? "on" : ""}" data-tag="${t}" onclick="toggleTag(${b.id},'${t}')">${t}</button>`).join("")}<button class="edit" title="Rediger tittel, serie og nummer" onclick="openEdit(${b.id})">✎</button></div></div><button class="read ${b.read ? "on" : ""}" onclick="toggleRead(${b.id})">✓</button></article>`;
         })
         .join("")
-    : '<div class="empty">Ingen bøker. Trykk «Hent fra Open Library».</div>';
+    : '<div class="empty">Ingen bøker. Trykk «Hent norske bøker».</div>';
 }
 
 async function patch(id, data) {
@@ -178,10 +178,10 @@ async function toggleHidden() {
 
 async function syncAuthor() {
   if (!selected) return;
-  setNotice("Henter bøker og omslag ...");
+  setNotice("Henter norske bøker og omslag fra Nasjonalbiblioteket ...");
   try {
     const r = await api(`/api/authors/${selected}/sync`, { method: "POST" });
-    setNotice(`${r.works} verk behandlet. ${r.inserted} nye og ${r.updated} oppdatert.`);
+    setNotice(`${r.works} norske bøker. ${r.inserted} nye og ${r.updated} oppdatert${r.removed ? `, ${r.removed} fjernet` : ""}.`);
     await loadAuthors();
     await loadBooks();
   } catch (e) {

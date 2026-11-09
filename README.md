@@ -1,6 +1,6 @@
 # Bokhylla for Debian 13
 
-En lokal webapp for forfattere, boklister, lest-status, A/H/T-tagger, Open Library-synkronisering, omslags-cache og ukentlig oppdatering.
+En lokal webapp for forfattere, boklister, lest-status, A/H/T-tagger, synkronisering av norske utgaver fra Nasjonalbiblioteket, omslags-cache og ukentlig oppdatering.
 
 ## Plattform
 
@@ -53,6 +53,14 @@ Ta gjerne en ekstra sikkerhetskopi av hele `data`-mappen.
 
 ## Synkronisering
 
+Boklistene hentes fra **Nasjonalbiblioteket** (api.nb.no) og inneholder bare bøker utgitt på **norsk** (bokmål/nynorsk) – også oversatte forfattere som Dan Brown og J.K. Rowling i norsk oversettelse.
+
+- Forfatteren slås opp som «Etternavn, Fornavn» (f.eks. «Nesbø, Jo»). Finner appen ingen bøker, kan du legge til forfatteren med navnet skrevet slik.
+- Alle utgaver/opplag av samme tittel slås sammen til én bok. Samlebind («Bok A ; Bok B») og oversettelser som også er katalogisert med originalspråket, tas ikke med.
+- Utgivelsesår: tidligste norske utgave hos Nasjonalbiblioteket, eller førsteutgivelsen fra Open Library når tittelen finnes der og er eldre. For oversatte bøker kan året derfor være året for en senere norsk utgave – rett det med ✎ om du vil.
+- Omslag hentes fra Nasjonalbiblioteket der de har det, ellers fra Open Library.
+- Bøker som ikke lenger er med i resultatet, fjernes ved neste synk – med mindre du har markert dem som lest, tagget, plassert i serie, skjult eller redigert dem.
+
 - Manuell synkronisering per forfatter i GUI-et
 - Manuell synkronisering av alle forfattere (kjører i bakgrunnen; synk-loggen viser framdriften)
 - Ukentlig synkronisering, standard søndag kl. 03:00
@@ -66,7 +74,7 @@ Lest-status, A/H/T-tagger, serie og skjuling påvirker ikke synkroniseringen. Re
 
 ## Første oppstart
 
-Forfatterne opprettes automatisk, men boklistene er tomme. Velg en forfatter og trykk `Hent fra Open Library`.
+Forfatterne opprettes automatisk, men boklistene er tomme. Velg en forfatter og trykk `Hent norske bøker`, eller `Oppdater alle`.
 
 ## Tester
 

@@ -103,22 +103,115 @@ def headers():
 def now():
     return datetime.now().isoformat(timespec="seconds")
 
-async def download_cover(client, cover_id, work_key):
-    if not cover_id:
-        return None
-    filename = re.sub(r"[^A-Za-z0-9_-]", "_", work_key) + ".jpg"
+NB_API = "https://api.nb.no/catalog/v1/items"
+NB_LANGUAGES = ("nob", "nno")
+NORWEGIAN = {"nob", "nno", "nor"}
+NB_PAGE_SIZE = 100
+
+def nb_creator(name: str) -> str:
+    """Author name as the National Library catalogues it: "Nesbø, Jo"."""
+    name = " ".join(name.split())
+    if "," in name:
+        return name
+    parts = name.split(" ")
+    return f"{parts[-1]}, {' '.join(parts[:-1])}" if len(parts) > 1 else name
+
+def main_title(title: str) -> str:
+    """The title without its subtitle (" : kriminalroman") and doubled spaces."""
+    return " ".join(re.split(r"\s+:\s+", title.strip())[0].split())
+
+def cover_filename(work_key):
+    return re.sub(r"[^A-Za-z0-9_-]", "_", work_key) + ".jpg"
+
+async def download_image(client, url, filename):
+    """Saves an image to the cover folder; returns the file name or None."""
     target = COVERS / filename
     if target.exists() and target.stat().st_size > 1000:
         return filename
-    url = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg?default=false"
     try:
         response = await client.get(url, follow_redirects=True)
     except httpx.HTTPError:
         return None
-    if response.status_code == 200 and response.headers.get("content-type", "").startswith("image/"):
+    if (
+        response.status_code == 200
+        and response.headers.get("content-type", "").startswith("image/")
+        and len(response.content) > 1000
+    ):
         target.write_bytes(response.content)
         return filename
     return None
+
+async def fetch_norwegian_editions(client, creator):
+    """Every Norwegian (bokmål/nynorsk) book edition by the author in the National Library."""
+    editions = []
+    for language in NB_LANGUAGES:
+        page = 0
+        while True:
+            response = await client.get(NB_API, params=[
+                ("q", "*"),
+                ("filter", f'creator:"{creator}"'),
+                ("filter", "mediatype:bøker"),
+                ("filter", f"languages:{language}"),
+                ("size", NB_PAGE_SIZE),
+                ("page", page),
+            ])
+            response.raise_for_status()
+            data = response.json()
+            editions += data.get("_embedded", {}).get("items", [])
+            total_pages = data.get("page", {}).get("totalPages", 0)
+            page += 1
+            if page >= total_pages or page >= 20:
+                break
+    return editions
+
+def group_by_title(editions):
+    """One book per title: earliest year, and a cover from any edition that has one."""
+    books = {}
+    for item in editions:
+        meta = item.get("metadata", {})
+        title = meta.get("title") or ""
+        # "A ; B" are collections of several books in one volume.
+        if not title or " ; " in title:
+            continue
+        # Translations are catalogued with the original language as well
+        # (e.g. ["eng", "nob", "aze"]); only purely Norwegian editions count.
+        languages = {l.get("code") for l in meta.get("languages", [])}
+        if not languages or not languages <= NORWEGIAN:
+            continue
+        name = main_title(title)
+        key = normalize(name)
+        if not key:
+            continue
+        year = parse_year(meta.get("originInfo", {}).get("issued"))
+        thumb = (item.get("_links", {}).get("thumbnail_custom") or {}).get("href")
+        book = books.setdefault(key, {"work_key": f"nb:{key}", "title": name, "year": year, "cover_url": None})
+        if year and (book["year"] is None or year < book["year"]):
+            book["year"] = year
+        if thumb and not book["cover_url"]:
+            book["cover_url"] = thumb.replace("{width},{height}", "0,300")
+    return list(books.values())
+
+async def open_library_lookup(client, title, author_name):
+    """The Open Library work with exactly this title by the author, if any.
+
+    Returns (first publish year, cover URL). Used to correct the year (the
+    National Library does not always have the first edition) and as a
+    fallback cover.
+    """
+    try:
+        response = await client.get(
+            "https://openlibrary.org/search.json",
+            params={"title": title, "author": author_name, "fields": "title,first_publish_year,cover_i", "limit": 5},
+        )
+        docs = response.json().get("docs", []) if response.status_code == 200 else []
+    except (httpx.HTTPError, ValueError):
+        return None, None
+    match = next((d for d in docs if normalize(d.get("title", "")) == normalize(title)), None)
+    if not match:
+        return None, None
+    cover_id = match.get("cover_i")
+    cover = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg?default=false" if cover_id else None
+    return match.get("first_publish_year"), cover
 
 def parse_year(value):
     try:
@@ -127,6 +220,7 @@ def parse_year(value):
         return None
 
 async def sync_author(author_id: int):
+    """Fetches the author's books published in Norwegian from the National Library."""
     with db() as con:
         author = con.execute("SELECT * FROM authors WHERE id=?", (author_id,)).fetchone()
         if not author:
@@ -137,34 +231,15 @@ async def sync_author(author_id: int):
         ).lastrowid
 
     try:
-        # 1. Fetch from Open Library. The database is not held open while waiting on the network.
+        creator = nb_creator(author["name"])
+        # 1. Fetch. The database is not held open while waiting on the network.
         async with httpx.AsyncClient(timeout=30, headers=headers()) as client:
-            search = await client.get("https://openlibrary.org/search/authors.json", params={"q": author["name"]})
-            search.raise_for_status()
-            docs = search.json().get("docs", [])
-            match = next((x for x in docs if normalize(x.get("name", "")) == normalize(author["name"])), None)
-            if not match and len(docs) == 1:
-                match = docs[0]
-            if not match or not match.get("key"):
-                hint = f" ({len(docs)} kandidater funnet, ingen eksakt treff)" if docs else ""
-                raise RuntimeError(f"Fant ikke forfatteren i Open Library{hint}")
-            key = match["key"]
-            works_response = await client.get(f"https://openlibrary.org/authors/{key}/works.json", params={"limit": 1000})
-            works_response.raise_for_status()
-
-            works = []
-            seen = set()
-            for work in works_response.json().get("entries", []):
-                work_key = work.get("key")
-                if not work_key or work_key in seen:
-                    continue
-                seen.add(work_key)
-                works.append({
-                    "work_key": work_key,
-                    "title": str(work.get("title") or "Uten tittel").strip(),
-                    "year": parse_year(work.get("first_publish_date")),
-                    "cover_id": (work.get("covers") or [None])[0],
-                })
+            works = group_by_title(await fetch_norwegian_editions(client, creator))
+            if not works:
+                raise RuntimeError(
+                    f"Fant ingen norske bøker for «{creator}» hos Nasjonalbiblioteket. "
+                    "Sjekk stavemåten, eller skriv navnet som «Etternavn, Fornavn»."
+                )
 
             with db() as con:
                 existing = {
@@ -172,17 +247,24 @@ async def sync_author(author_id: int):
                     for row in con.execute("SELECT * FROM books WHERE author_id=?", (author_id,))
                 }
 
-            # 2. Download missing covers, a few at a time.
+            # 2. First publish year and covers, a few books at a time.
             limit = asyncio.Semaphore(COVER_DOWNLOADS_AT_ONCE)
 
-            async def cover_for(work):
-                current = existing.get(work["work_key"], {}).get("cover_file")
-                if current:
-                    return current
+            async def complete(work):
                 async with limit:
-                    return await download_cover(client, work["cover_id"], work["work_key"])
+                    ol_year, ol_cover = await open_library_lookup(client, work["title"], author["name"])
+                    if ol_year and (work["year"] is None or ol_year < work["year"]):
+                        work["year"] = ol_year
+                    current = existing.get(work["work_key"], {}).get("cover_file")
+                    if current:
+                        return current
+                    filename = cover_filename(work["work_key"])
+                    for url in (work["cover_url"], ol_cover):
+                        if url and (saved := await download_image(client, url, filename)):
+                            return saved
+                    return None
 
-            covers = await asyncio.gather(*(cover_for(w) for w in works))
+            covers = await asyncio.gather(*(complete(w) for w in works))
 
         # 3. Write everything in one short transaction.
         inserted = 0
@@ -206,13 +288,29 @@ async def sync_author(author_id: int):
                         (author_id, work["work_key"], work["title"], work["year"], cover_file),
                     )
                     inserted += 1
+            # Books that are no longer in the result (e.g. fetched earlier from
+            # Open Library in all languages) are removed, unless they carry
+            # something of the user's own.
+            current_keys = {w["work_key"] for w in works}
+            removed = 0
+            for key, book in existing.items():
+                untouched = (
+                    not book["read"] and not book["tags"] and book["series_name"] == NO_SERIES
+                    and book["series_order"] is None and not book["hidden"] and not book["manual_lock"]
+                )
+                if key not in current_keys and untouched:
+                    con.execute("DELETE FROM books WHERE id=?", (book["id"],))
+                    removed += 1
             finished = now()
-            con.execute("UPDATE authors SET openlibrary_key=?,last_sync=? WHERE id=?", (key, finished, author_id))
+            con.execute("UPDATE authors SET openlibrary_key=?,last_sync=? WHERE id=?", (f"nb:{creator}", finished, author_id))
+            message = f"{inserted} nye, {updated} oppdatert"
+            if removed:
+                message += f", {removed} fjernet"
             con.execute(
                 "UPDATE sync_log SET finished=?,status='ok',message=? WHERE id=?",
-                (finished, f"{inserted} nye, {updated} oppdatert", log_id),
+                (finished, message, log_id),
             )
-        return {"status": "ok", "inserted": inserted, "updated": updated, "works": len(works)}
+        return {"status": "ok", "inserted": inserted, "updated": updated, "removed": removed, "works": len(works)}
     except Exception as exc:
         with db() as con:
             con.execute(
